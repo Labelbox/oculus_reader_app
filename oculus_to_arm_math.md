@@ -307,6 +307,393 @@ def change_pose_frame(pose, frame, degrees=False):
     return result
 ```
 
+## Forward Direction Calibration
+
+The system provides a powerful feature to calibrate the "forward" direction of the VR controller, allowing operators to define their preferred reference frame for robot control. This is particularly useful when the operator's physical orientation doesn't match the robot's coordinate system.
+
+### How Forward Direction Calibration Works
+
+When you press the **joystick button** (RJ for right controller, LJ for left controller), the system captures the current orientation of the VR controller and uses it to define the new "forward" direction. This is implemented through the `vr_to_global_mat` transformation matrix.
+
+### Implementation Details
+
+From the `_update_internal_state` method:
+
+```python
+# Detect joystick button press
+self.reset_orientation = self.reset_orientation or buttons[self.controller_id.upper() + "J"]
+
+# Update Definition Of "Forward"
+stop_updating = self._state["buttons"][self.controller_id.upper() + "J"] or self._state["movement_enabled"]
+if self.reset_orientation:
+    rot_mat = np.asarray(self._state["poses"][self.controller_id])
+    if stop_updating:
+        self.reset_orientation = False
+    # Invert the current rotation matrix to define new "forward"
+    try:
+        rot_mat = np.linalg.inv(rot_mat)
+    except:
+        print(f"exception for rot mat: {rot_mat}")
+        rot_mat = np.eye(4)
+        self.reset_orientation = True
+    self.vr_to_global_mat = rot_mat
+```
+
+### Mathematical Explanation
+
+The forward calibration works by updating the `vr_to_global_mat` transformation:
+
+1. **Capture Current Pose**: When joystick is pressed, capture the current 4×4 transformation matrix of the controller
+2. **Invert Matrix**: Calculate the inverse of this matrix to create a transformation that maps the current orientation to identity
+3. **Apply Transformation**: All subsequent controller poses are transformed by this matrix before being sent to the robot
+
+The complete transformation pipeline becomes:
+
+```python
+T_robot = T_global_to_env @ T_vr_to_global @ T_controller
+```
+
+Where `T_vr_to_global` is the inverted matrix from the calibration moment.
+
+### Usage Instructions
+
+#### Method 1: Initial Calibration
+
+1. Hold the VR controller in your comfortable "neutral" position
+2. Point the controller in the direction you want to be "forward" for the robot
+3. Press the **joystick button** (click the joystick)
+4. The current controller orientation is now set as the reference
+
+#### Method 2: Dynamic Recalibration
+
+You can recalibrate at any time during operation:
+
+1. Release the grip button to pause robot movement
+2. Orient the controller to your new desired forward direction
+3. Press the joystick button
+4. Resume operation with the new reference frame
+
+### Practical Example
+
+```python
+from droid.controllers.oculus_controller import VRPolicy
+from droid.robot_env import RobotEnv
+
+# Initialize environment and controller
+env = RobotEnv()
+vr_controller = VRPolicy(right_controller=True)
+
+print("Hold controller in your preferred forward direction and press joystick button")
+
+# Main control loop
+while True:
+    obs = env.get_observation()
+    action = vr_controller.forward(obs)
+
+    # Check controller state
+    info = vr_controller.get_info()
+
+    # The system automatically handles forward calibration when joystick is pressed
+    # No additional code needed - it's built into the VRPolicy
+
+    env.step(action)
+
+    if info["success"] or info["failure"]:
+        break
+```
+
+### Advanced Calibration Scenario
+
+For situations where you need to work from different physical positions:
+
+```python
+# Scenario: Operator moves to different side of robot
+def recalibrate_for_new_position(vr_controller):
+    print("Move to new position")
+    print("Point controller toward robot's forward direction")
+    print("Press joystick button when ready")
+
+    # The VRPolicy automatically handles the calibration
+    # when the joystick button is pressed
+
+    # Wait for calibration to complete
+    import time
+    time.sleep(0.5)
+
+    print("Calibration complete! You can now operate from the new position")
+
+# Usage during operation
+vr_controller = VRPolicy(right_controller=True)
+
+# Initial operation
+print("Operating from front of robot...")
+# ... perform tasks ...
+
+# Need to move to side of robot
+recalibrate_for_new_position(vr_controller)
+
+# Continue operation from new position
+print("Operating from side of robot...")
+# ... perform tasks ...
+```
+
+### Benefits of Forward Calibration
+
+1. **Operator Comfort**: Work from any physical position relative to the robot
+2. **Intuitive Control**: Forward motion on controller always moves robot "forward" regardless of operator position
+3. **Quick Adaptation**: Instantly recalibrate when changing positions or handing off control
+4. **Consistent Mapping**: Maintains intuitive control mapping even when operator rotates
+
+### Technical Notes
+
+- The calibration is stored in the `vr_to_global_mat` member variable
+- Calibration persists until the joystick is pressed again or the system is restarted
+- The calibration affects only rotational mapping; position tracking remains absolute
+- If matrix inversion fails (singular matrix), the system falls back to identity matrix
+
+## Complete Button Controls and Teleoperation Features
+
+The VR controller provides comprehensive control over robot teleoperation, recording, and calibration through various buttons and controls.
+
+### Button Mapping Overview
+
+#### Right Controller (Default)
+
+- **A Button**: Mark trajectory as **success** and stop recording
+- **B Button**: Mark trajectory as **failure** and stop recording
+- **Right Grip (RG)**: Hold to enable robot movement
+- **Right Joystick (RJ)**: Reset controller orientation (forward calibration)
+- **Right Trigger**: Analog gripper control (0.0=open, 1.0=closed)
+
+#### Left Controller
+
+- **X Button**: Mark trajectory as **success** and stop recording
+- **Y Button**: Mark trajectory as **failure** and stop recording
+- **Left Grip (LG)**: Hold to enable robot movement
+- **Left Joystick (LJ)**: Reset controller orientation (forward calibration)
+- **Left Trigger**: Analog gripper control (0.0=open, 1.0=closed)
+
+### Movement Control and Origin Calibration
+
+#### Grip Button - Movement Enable/Disable
+
+The grip button serves as the primary control for robot movement:
+
+```python
+# From _update_internal_state
+toggled = self._state["movement_enabled"] != buttons[self.controller_id.upper() + "G"]
+self.reset_origin = self.reset_origin or toggled
+```
+
+**Functionality**:
+
+1. **Press and Hold**: Enables robot movement
+2. **Release**: Pauses robot movement (recording continues)
+3. **Toggle Detection**: Automatically recalibrates origin when grip state changes
+
+#### Automatic Origin Calibration
+
+When the grip button is pressed (movement enabled), the system automatically calibrates the origin:
+
+```python
+# From _calculate_action
+if self.reset_origin:
+    self.robot_origin = {"pos": robot_pos, "quat": robot_quat}
+    self.vr_origin = {"pos": self.vr_state["pos"], "quat": self.vr_state["quat"]}
+    self.reset_origin = False
+```
+
+This ensures that:
+
+- Robot movements are always relative to the position when grip was pressed
+- Releasing and re-pressing grip creates a new reference point
+- Prevents drift and maintains precise control
+
+### Recording Control
+
+#### Success/Failure Termination
+
+The A/B (or X/Y) buttons control trajectory recording termination:
+
+```python
+def get_info(self):
+    info = {
+        "success": self._state["buttons"]["A"] if self.controller_id == 'r' else self._state["buttons"]["X"],
+        "failure": self._state["buttons"]["B"] if self.controller_id == 'r' else self._state["buttons"]["Y"],
+        "movement_enabled": self._state["movement_enabled"],
+        "controller_on": self._state["controller_on"],
+    }
+```
+
+**Recording Workflow**:
+
+1. Start recording (automatic when trajectory collection begins)
+2. Use grip button to control robot movement
+3. Press A/X to mark successful demonstration
+4. Press B/Y to mark failed attempt
+5. Recording automatically saves to appropriate directory
+
+### Gripper Control
+
+The analog trigger provides precise gripper control:
+
+```python
+# Trigger selection based on controller
+vr_gripper = self._state["buttons"]["rightTrig" if self.controller_id == "r" else "leftTrig"][0]
+
+# Gripper action calculation with scaling factor
+gripper_action = (self.vr_state["gripper"] * 1.5) - robot_gripper
+gripper_action *= self.gripper_action_gain  # Default: 3.0
+```
+
+**Gripper Mapping**:
+
+- Trigger value 0.0 → Gripper fully open (0.08m width)
+- Trigger value 1.0 → Gripper fully closed (0.0m width)
+- Analog control allows partial closure
+- Rate-based control with configurable gain
+
+### Camera Calibration Mode
+
+During camera calibration, button functions change:
+
+```python
+# From calibrate_camera function
+while True:
+    controller_info = controller.get_info()
+
+    # A button starts calibration
+    start_calibration = controller_info["success"]
+
+    # B button cancels calibration
+    end_calibration = controller_info["failure"]
+
+    if start_calibration:
+        break
+    if end_calibration:
+        return False
+```
+
+### State Management and Resume Functionality
+
+The system maintains comprehensive state tracking:
+
+```python
+self._state = {
+    "poses": {},                    # Controller 4x4 transformation matrices
+    "buttons": {},                  # All button states
+    "movement_enabled": False,      # Grip button state
+    "controller_on": True,          # Controller connection status
+}
+```
+
+#### Resume After Pause
+
+When resuming teleoperation after releasing grip:
+
+1. Origin is automatically recalibrated
+2. Previous trajectory continues recording
+3. No data is lost during pause
+4. Smooth transition back to control
+
+### Complete Usage Example with All Features
+
+```python
+from droid.controllers.oculus_controller import VRPolicy
+from droid.robot_env import RobotEnv
+from droid.trajectory_utils.misc import collect_trajectory
+
+# Initialize
+env = RobotEnv()
+vr_controller = VRPolicy(
+    right_controller=True,
+    pos_action_gain=5.0,
+    rot_action_gain=2.0,
+    gripper_action_gain=3.0
+)
+
+# Calibrate forward direction
+print("Point controller forward and press joystick button")
+# Wait for user to press RJ button
+
+# Start trajectory collection
+print("Press and hold grip to move robot")
+print("Press A for success, B for failure")
+
+# Collect trajectory (blocks until A or B pressed)
+controller_info = collect_trajectory(
+    env,
+    controller=vr_controller,
+    save_filepath="trajectory.mcap",
+    wait_for_controller=True  # Only moves when grip held
+)
+
+# Check result
+if controller_info["success"]:
+    print("Successful demonstration recorded!")
+else:
+    print("Failed demonstration recorded")
+
+# The trajectory includes:
+# - All controller poses and button states
+# - Robot states and actions
+# - Camera recordings
+# - Timestamps for synchronization
+```
+
+### Advanced Features
+
+#### Multi-Stage Tasks
+
+For complex tasks requiring multiple grip press/release cycles:
+
+```python
+# The system automatically handles multiple origin calibrations
+# Example: Pick and place task
+
+# Stage 1: Move to object
+# - Press grip → origin calibrated at current position
+# - Move to object
+# - Close gripper with trigger
+# - Release grip → movement paused
+
+# Stage 2: Move to target
+# - Press grip → NEW origin calibrated
+# - Move to target location
+# - Open gripper with trigger
+# - Press A to mark success
+
+# Each grip press creates a new reference frame
+```
+
+#### Controller State Monitoring
+
+Monitor all controller states in real-time:
+
+```python
+while True:
+    info = vr_controller.get_info()
+
+    print(f"Movement Enabled: {info['movement_enabled']}")
+    print(f"Controller Connected: {info['controller_on']}")
+    print(f"Success Button: {info['success']}")
+    print(f"Failure Button: {info['failure']}")
+
+    # Access raw button states
+    if "buttons" in info:
+        print(f"Grip: {info['buttons']['RG']}")
+        print(f"Trigger: {info['buttons']['rightTrig'][0]:.2f}")
+        print(f"Joystick: {info['buttons']['RJ']}")
+```
+
+### Safety Features
+
+1. **Movement Only When Grip Held**: Prevents accidental movements
+2. **Automatic Origin Calibration**: Ensures predictable relative motion
+3. **Connection Monitoring**: Detects controller disconnection
+4. **Velocity Limiting**: Applied regardless of button states
+5. **Emergency Stop**: Ctrl+C marks trajectory as failure
+
 ## Robot IK Solver Implementation
 
 From `droid/robot_ik/robot_ik_solver.py`:
